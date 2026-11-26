@@ -67,3 +67,7 @@ cargo clippy --all-targets
 ```
 
 Built with [iced](https://iced.rs). The background and icon in `assets/` were generated with Gemini; the originals are in `assets/source/`.
+
+## Licence
+
+[MIT](LICENSE).
