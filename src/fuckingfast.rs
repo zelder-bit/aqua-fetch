@@ -4,12 +4,13 @@
 //! Clean-room implementation written from a behaviour description, not from
 //! JDownloader's GPL plugin or any port of it.
 //!
-//! Flow: GET https://fuckingfast.co/<id> -> POST /f/<id>/dl (empty body, result
+//! Flow: GET https://fuckingfast.co/<id> -> direct link from the page, or POST
+//! /f/<id>/go and take its Hx-Redirect header -> POST /f/<id>/dl (empty body, result
 //! ignored) -> GET the direct link with Referer and the same cookies.
 use crate::engine::{self, BASE_DELAY_MS, Event, RETRIES};
 use crate::model::{Item, Status, percent_decode, safe_rel};
 use regex::Regex;
-use reqwest::header::{ACCEPT, CONTENT_LENGTH, COOKIE, HeaderMap, HeaderValue, REFERER, SET_COOKIE, USER_AGENT};
+use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, REFERER, SET_COOKIE, USER_AGENT};
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -26,6 +27,7 @@ const ACCEPT_HTML: &str = "text/html,application/xhtml+xml,application/xml;q=0.9
 /// File pages are a few KB; this only stops a hostile server from filling memory.
 const MAX_PAGE: usize = 2 << 20;
 const GENERIC_TITLES: [&str; 3] = ["fuckingfast", "fuckingfast.co", "fuckingfast - download"];
+const TURNSTILE: &str = "This file needs a captcha (Cloudflare Turnstile); open it in a browser";
 const CHALLENGE: &str = "Cloudflare check: copy cf_clearance from a browser that opened the page into fuckingfast.json, with that browser's user agent, then Retry";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,13 +82,19 @@ pub struct Page {
     pub title: Option<String>,
     pub size: Option<u64>,
     pub direct: Option<String>,
+    /// The page refers to `/f/<id>/go`, which hands out the direct link.
+    pub go: bool,
+    /// An unsolved Turnstile captcha guards `/go`.
+    pub turnstile: bool,
 }
 
 static TITLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<title[^>]*>(.*?)</title>").unwrap());
 static META: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<meta\b[^>]*>").unwrap());
 static ATTR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?is)([a-z:_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap());
 static SIZE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"Size:\s*([0-9]+(?:[.,][0-9]+)?)\s*(B|KB|MB|GB|TB|PB|KiB|MiB|GiB|TiB|PiB)").unwrap());
+    LazyLock::new(|| Regex::new(r"Size\s*[:-]\s*([0-9]+(?:[.,][0-9]+)?)\s*(B|KB|MB|GB|TB|PB|KiB|MiB|GiB|TiB|PiB)").unwrap());
+static GO: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/f/[A-Za-z0-9]{12}/go\b").unwrap());
+static TURNSTILE_OFF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"turnstileSuccess:\s*false").unwrap());
 static OPEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"window\.open\(\s*["']([^"']+)["']"#).unwrap());
 static LOCATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?:^|[^\w.$-])(?:window\.|document\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']"#).unwrap());
@@ -121,7 +129,9 @@ pub fn parse_page(html: &str, page_url: &str) -> Page {
         let url = Url::parse(page_url).ok()?.join(raw.trim()).ok()?;
         matches!(url.scheme(), "http" | "https").then(|| url.to_string())
     });
-    Page { title, size, direct }
+    let go = GO.is_match(html);
+    let turnstile = html.contains("challenges.cloudflare.com/turnstile/") && TURNSTILE_OFF.is_match(html);
+    Page { title, size, direct, go, turnstile }
 }
 
 /// Unescaped, whitespace collapsed, and None for empty or site-name-only titles.
@@ -380,7 +390,9 @@ struct Meta {
     name: String,
     size: Option<u64>,
     /// Signed link: never logged or stored, only the host is safe to show.
-    direct: Url,
+    /// None when the page only offers `/go`.
+    direct: Option<Url>,
+    turnstile: bool,
 }
 
 type Fail = (Status, bool);
@@ -412,21 +424,14 @@ async fn page_once(client: &Client, s: &Session, url: &Url, link: &Link) -> Resu
     let mut resp = client.get(url.clone()).headers(h).send().await.map_err(net)?;
     let st = resp.status();
     let head = resp.headers().clone();
-    let mut body = Vec::new();
-    while let Some(c) = resp.chunk().await.map_err(net)? {
-        body.extend_from_slice(&c);
-        if body.len() > MAX_PAGE {
-            break;
-        }
-    }
-    let body = String::from_utf8_lossy(&body);
+    let body = small_body(&mut resp).await.map_err(net)?;
     let page = parse_page(&body, url.as_str());
     // A normal page can carry Cloudflare's challenge-platform script, so a found link wins over the markers.
-    if let (true, Some(direct)) = (st.is_success(), &page.direct) {
-        let direct = Url::parse(direct).map_err(|e| (failed(e.to_string()), false))?;
+    if st.is_success() && (page.direct.is_some() || page.go) {
+        let direct = page.direct.map(|d| Url::parse(&d)).transpose().map_err(|e| (failed(e.to_string()), false))?;
         let name = page.title.or_else(|| link.fragment.clone()).unwrap_or_else(|| link.id.clone());
         let set = set_cookies(&head, url.host_str().unwrap_or_default());
-        return Ok((Meta { name, size: page.size, direct }, set));
+        return Ok((Meta { name, size: page.size, direct, turnstile: page.turnstile }, set));
     }
     let c = st.as_u16();
     if c == 404 {
@@ -440,6 +445,61 @@ async fn page_once(client: &Client, s: &Session, url: &Url, link: &Link) -> Resu
         return Err((failed(format!("HTTP {st}")), st.is_server_error() || c == 408 || c == 429));
     }
     Err((failed("No download link on the page (the site may have changed)"), false))
+}
+
+/// The body, cut off after MAX_PAGE bytes.
+async fn small_body(resp: &mut reqwest::Response) -> Result<String, reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(c) = resp.chunk().await? {
+        body.extend_from_slice(&c);
+        if body.len() > MAX_PAGE {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// POSTs `/f/<id>/go` for the direct link, retrying network errors, 429 and 5xx.
+async fn go_link(client: &Client, s: &mut Session, base: &str, link: &Link) -> Result<Url, Status> {
+    let url = Url::parse(&format!("{base}/f/{}/go", link.id)).map_err(|e| failed(e.to_string()))?;
+    let page = format!("{base}/{}", link.id);
+    let mut attempt = 0;
+    loop {
+        match go_once(client, s, &url, &page).await {
+            Ok((direct, set)) => {
+                s.cookies.extend(set);
+                return Ok(direct);
+            }
+            Err((e, retry)) if !retry || attempt == RETRIES => return Err(e),
+            Err(_) => tokio::time::sleep(Duration::from_millis(BASE_DELAY_MS << attempt)).await,
+        }
+        attempt += 1;
+    }
+}
+
+async fn go_once(client: &Client, s: &Session, url: &Url, page: &str) -> Result<(Url, Vec<Cookie>), Fail> {
+    let net = |e: reqwest::Error| (failed(format!("Network error: {}", engine::short(e))), true);
+    let h = headers(s, url, Some(page), None).map_err(|e| (e, false))?;
+    let req = client.post(url.clone()).headers(h).header(CONTENT_TYPE, "application/x-www-form-urlencoded").header(CONTENT_LENGTH, 0);
+    let mut resp = req.body("").send().await.map_err(net)?;
+    let st = resp.status();
+    let head = resp.headers().clone();
+    let body = small_body(&mut resp).await.map_err(net)?;
+    if st.is_success() {
+        // htmx-style reply: the signed link is only in this header.
+        let direct = head.get("hx-redirect").and_then(|v| v.to_str().ok()).and_then(|v| Url::parse(page).ok()?.join(v.trim()).ok());
+        if let Some(d) = direct.filter(|u| matches!(u.scheme(), "http" | "https")) {
+            return Ok((d, set_cookies(&head, url.host_str().unwrap_or_default())));
+        }
+    }
+    if is_challenge(&head, if st.is_success() { "" } else { &body }) {
+        return Err((Status::Blocked(CHALLENGE.into()), false));
+    }
+    if st.is_success() {
+        return Err((failed("Site gave no download link (/go)"), false));
+    }
+    let c = st.as_u16();
+    Err((failed(format!("HTTP {c} from /go")), st.is_server_error() || c == 429))
 }
 
 /// Name and size for a new row. The name falls back to the link's #fragment, then its id.
@@ -459,6 +519,11 @@ pub async fn download(client: &Client, item: &Item, on: impl FnMut(Event) + Send
 
 async fn run(client: &Client, s: &mut Session, base: &str, link: &Link, item: &Item, on: impl FnMut(Event) + Send) -> Result<(), Status> {
     let m = read_page(client, s, base, link).await?;
+    let direct = match m.direct {
+        Some(d) => d,
+        None if m.turnstile => return Err(Status::Blocked(TURNSTILE.into())),
+        None => go_link(client, s, base, link).await?,
+    };
     let page = format!("{base}/{}", link.id);
     // The site counts the download here; the file comes either way, so every failure is ignored.
     if let Ok(cb) = Url::parse(&format!("{base}/f/{}/dl", link.id))
@@ -467,8 +532,8 @@ async fn run(client: &Client, s: &mut Session, base: &str, link: &Link, item: &I
     {
         s.cookies.extend(set_cookies(r.headers(), cb.host_str().unwrap_or_default()));
     }
-    let h = headers(s, &m.direct, Some(&page), None)?;
-    engine::download_from(client, item, m.direct.as_str(), &h, true, on).await.map_err(Status::Failed)
+    let h = headers(s, &direct, Some(&page), None)?;
+    engine::download_from(client, item, direct.as_str(), &h, true, on).await.map_err(Status::Failed)
 }
 
 #[cfg(test)]
@@ -546,6 +611,19 @@ mod tests {
         assert_eq!(parse_page("Size: 2 PB", PAGE).size, Some(2 << 50));
         assert_eq!(parse_page("Size: big", PAGE).size, None);
         assert_eq!(unescape("a &amp;amp; &bogus; & &#9731; &#xZZ;"), "a &amp; &bogus; & ☃ &#xZZ;");
+    }
+
+    #[test]
+    fn size_dash_go_and_turnstile() {
+        assert_eq!(parse_page("Size - 2 GB |", PAGE).size, Some(2 << 30));
+        assert_eq!(parse_page("Size: 1.5 GB | Downloads: 12345", PAGE).size, Some(1_610_612_736));
+        let p = parse_page(r#"<button hx-post="/f/abcDEF123456/go">DL</button>"#, PAGE);
+        assert!(p.go && !p.turnstile && p.direct.is_none());
+        assert!(!parse_page("/f/abcDEF123456/gone", PAGE).go);
+        let ts = r#"<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>"#;
+        assert!(parse_page(&format!("{ts} x-data='{{turnstileSuccess: false}}'"), PAGE).turnstile);
+        assert!(!parse_page(&format!("{ts} turnstileSuccess: true"), PAGE).turnstile);
+        assert!(!parse_page("turnstileSuccess: false", PAGE).turnstile);
     }
 
     #[test]
@@ -768,6 +846,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// `/go` pages: the link comes from the Hx-Redirect header; everything else goes to `site`.
+    fn go_site(req: &str) -> Vec<u8> {
+        let line = req.lines().next().unwrap_or("");
+        let has = |h: &str| req.lines().any(|l| l.eq_ignore_ascii_case(h));
+        let host = req.lines().find_map(|l| l.get(..6).filter(|p| p.eq_ignore_ascii_case("host: ")).map(|_| &l[6..])).unwrap_or("");
+        let ts = "<script src='https://challenges.cloudflare.com/turnstile/v0/api.js'></script> turnstileSuccess: false";
+        for id in ["goRelative12", "goAbsolute12", "noHeader1234", "turnstile123", "flakyGoFlaky", "goneGoneGone"] {
+            if line.starts_with(&format!("GET /{id} ")) {
+                let extra = if id == "turnstile123" { ts } else { "" };
+                let html = format!(r#"<title>Game.rar</title>Size - 48.8 KB | <button hx-post="/f/{id}/go">DL</button>{extra}"#);
+                return resp("200 OK\r\nContent-Type: text/html\r\nSet-Cookie: sess=s1; Path=/", html.as_bytes());
+            }
+        }
+        let form = has("content-type: application/x-www-form-urlencoded") && has("content-length: 0") && has("cookie: sess=s1");
+        match line.split(' ').nth(1).unwrap_or("") {
+            "/f/goRelative12/go" if form => resp("200 OK\r\nHx-Redirect: /file.bin?token=x&expires=1", b"OK"),
+            "/f/goAbsolute12/go" if form => resp(&format!("200 OK\r\nHx-Redirect: http://{host}/file.bin?token=x&expires=1"), b"OK"),
+            "/f/noHeader1234/go" => resp("200 OK", b"OK"),
+            "/f/flakyGoFlaky/go" => resp("503 Busy", b""),
+            "/f/goneGoneGone/go" => resp("404 Not Found", b""),
+            _ => site(req),
+        }
+    }
+
+    #[tokio::test]
+    async fn go_flow() {
+        let (base, log) = serve(go_site).await;
+        let c = Client::new();
+        let l = |id: &str| Link { id: id.into(), fragment: None };
+
+        // Probing reads name and size and never POSTs, not even on a Turnstile page.
+        for id in ["goRelative12", "turnstile123"] {
+            let m = read_page(&c, &mut session(), &base, &l(id)).await.ok().unwrap();
+            assert_eq!((m.name.as_str(), m.size, m.direct.is_none()), ("Game.rar", Some(49_971), true));
+        }
+        assert!(!log.lock().unwrap().iter().any(|r| r.starts_with("POST ")));
+
+        let (rel, dir) = item("go");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(part_path(&rel.dest), &data()[..20_000]).unwrap();
+        assert_eq!(run(&c, &mut session(), &base, &l("goRelative12"), &rel, |_| {}).await, Ok(()));
+        assert_eq!(std::fs::read(&rel.dest).unwrap(), data());
+        let go = log.lock().unwrap().iter().find(|r| r.starts_with("POST /f/goRelative12/go ")).unwrap().to_ascii_lowercase();
+        assert!(go.contains(&format!("referer: {base}/goRelative12\r\n").to_ascii_lowercase()), "{go}");
+        assert!(go.contains("user-agent: testua/1\r\n"), "{go}");
+        assert!(log.lock().unwrap().last().unwrap().to_ascii_lowercase().contains("range: bytes=20000-\r\n"));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let (item, dir) = item("goabs");
+        assert_eq!(run(&c, &mut session(), &base, &l("goAbsolute12"), &item, |_| {}).await, Ok(()));
+        assert_eq!(std::fs::read(&item.dest).unwrap(), data());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let r = run(&c, &mut session(), &base, &l("noHeader1234"), &item, |_| {}).await;
+        assert_eq!(r, Err(failed("Site gave no download link (/go)")));
+        let r = run(&c, &mut session(), &base, &l("turnstile123"), &item, |_| {}).await;
+        assert!(matches!(r, Err(Status::Blocked(m)) if m.contains("Turnstile")));
+        assert!(!log.lock().unwrap().iter().any(|r| r.starts_with("POST /f/turnstile123/")));
+        let r = run(&c, &mut session(), &base, &l("goneGoneGone"), &item, |_| {}).await;
+        assert_eq!(r, Err(failed("HTTP 404 from /go")));
+        let before = log.lock().unwrap().len();
+        let r = run(&c, &mut session(), &base, &l("flakyGoFlaky"), &item, |_| {}).await;
+        assert_eq!(r, Err(failed("HTTP 503 from /go")));
+        // one page GET, then every /go try
+        assert_eq!(log.lock().unwrap().len() - before, RETRIES as usize + 2);
+        assert!(!item.dest.exists());
+    }
+
     #[tokio::test]
     #[ignore = "network; set FFDL_TEST_URL, and FFDL_TEST_COOKIE / FFDL_TEST_UA when Cloudflare asks"]
     async fn fuckingfast_live() {
@@ -779,7 +925,7 @@ mod tests {
         };
         let c = Client::builder().connect_timeout(Duration::from_secs(20)).read_timeout(Duration::from_secs(60)).build().unwrap();
         let m = read_page(&c, &mut s, BASE, &link).await.unwrap_or_else(|e| panic!("{e:?}"));
-        println!("name={:?} size={:?} direct host={:?}", m.name, m.size, m.direct.host_str());
+        println!("name={:?} size={:?} direct host={:?}", m.name, m.size, m.direct.as_ref().and_then(|d| d.host_str()));
         let (mut item, dir) = item("live");
         item.url = link.page();
         // Fetch about 15 seconds' worth, then stop: enough to prove the file streams.
