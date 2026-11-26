@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Aqua Fetch
+Comment=Download many files and public S3 data sets at once
+Exec=aqua-fetch
+Icon=aqua-fetch
+Categories=Network;FileTransfer;
+Terminal=false
