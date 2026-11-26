@@ -268,7 +268,8 @@ fn set_cookies(headers: &HeaderMap, host: &str) -> Vec<Cookie> {
 fn browser_cookies(browser: &str) -> Result<Vec<Cookie>, String> {
     let d = Some(vec![HOST.to_string()]);
     let got = match browser.trim().to_ascii_lowercase().as_str() {
-        "firefox" => rookie::firefox(d),
+        // rookie 0.5.6 only knows ~/.mozilla; Firefox 147+ moved profiles to ~/.config/mozilla.
+        "firefox" => rookie::firefox(d.clone()).or_else(|e| xdg_firefox_db().ok_or(e).and_then(|db| rookie::firefox_based(db, d))),
         "librewolf" => rookie::librewolf(d),
         "zen" => rookie::zen(d),
         "chrome" => rookie::chrome(d),
@@ -284,11 +285,27 @@ fn browser_cookies(browser: &str) -> Result<Vec<Cookie>, String> {
     Ok(got.iter().filter_map(|c| Cookie::new(&c.domain, false, &c.name, &c.value)).filter(|c| in_scope(&c.domain)).collect())
 }
 
+/// The most recently written cookies.sqlite under `$XDG_CONFIG_HOME/mozilla/firefox`: the profile in use.
+fn xdg_firefox_db() -> Option<PathBuf> {
+    let root = config_dir().join("mozilla/firefox");
+    std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|e| {
+            let db = e.ok()?.path().join("cookies.sqlite");
+            Some((db.metadata().ok()?.modified().ok()?, db))
+        })
+        .max()
+        .map(|(_, db)| db)
+}
+
+fn config_dir() -> PathBuf {
+    let cfg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).filter(|p| p.is_absolute());
+    cfg.unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"))
+}
+
 /// `$XDG_CONFIG_HOME/aqua-fetch/fuckingfast.json`, usually under `~/.config`.
 pub fn config_path() -> PathBuf {
-    let cfg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).filter(|p| p.is_absolute());
-    let home = || PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    cfg.unwrap_or_else(|| home().join(".config")).join("aqua-fetch/fuckingfast.json")
+    config_dir().join("aqua-fetch/fuckingfast.json")
 }
 
 /// Every field is optional. All cookie sources are merged; on a name clash the
@@ -771,5 +788,13 @@ mod tests {
             Err(_) => assert!(part_path(&item.dest).metadata().unwrap().len() > 0),
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Reads your real Firefox profile; prints cookie names only.
+    #[test]
+    #[ignore = "reads the local Firefox profile"]
+    fn firefox_import_local() {
+        let c = browser_cookies("firefox").unwrap();
+        println!("db={:?} names={:?}", xdg_firefox_db(), c.iter().map(|c| (&c.domain, &c.name)).collect::<Vec<_>>());
     }
 }

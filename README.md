@@ -66,7 +66,7 @@ The site sits behind a Cloudflare check. When it asks for one, the row shows **N
    Every field is optional, so use whichever cookie source is easiest:
    - `cookie`: a raw `Cookie` header copied from the browser's dev tools.
    - `cookies_txt`: a Netscape `cookies.txt` export.
-   - `browser`: read the cookies straight from a browser profile: `firefox`, `librewolf`, `zen`, `chrome`, `chromium`, `brave`, `edge`, `vivaldi`, `opera` or `any`.
+   - `browser`: read the cookies straight from a browser profile (for Firefox, also the newer `~/.config/mozilla/firefox` location): `firefox`, `librewolf`, `zen`, `chrome`, `chromium`, `brave`, `edge`, `vivaldi`, `opera` or `any`.
 
    If more than one source sets the same cookie, `cookie` beats `cookies_txt`, which beats `browser`. Only cookies for `fuckingfast.co` and its subdomains are used or sent.
 3. Press **Retry**. The file is read again on every try, so there is no need to restart.
