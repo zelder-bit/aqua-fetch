@@ -1,5 +1,5 @@
 use aqua_fetch::model::{Item, Saved, Status, file_name, part_path, safe_rel, unique};
-use aqua_fetch::{engine, s3, store};
+use aqua_fetch::{engine, fuckingfast, s3, store};
 use iced::futures::{channel::mpsc, stream};
 use iced::widget::{button, column, container, image, progress_bar, row, scrollable, slider, space, stack, text, text_editor};
 use iced::{Center, Color, ContentFit, Element, Fill, Font, Subscription, Task, Theme, task};
@@ -45,9 +45,11 @@ enum Msg {
     /// Bucket name and its objects, for a prefix row.
     /// Row id, run number, then the bucket name and its objects.
     Listed(u64, u64, Result<(String, Vec<s3::Object>), String>),
+    /// Row id, run number, then the file name and size read from a file-host page.
+    Probed(u64, u64, Result<(String, Option<u64>), Status>),
     Ev(u64, engine::Event),
-    /// Row id, run number, result.
-    Finished(u64, u64, Result<(), String>),
+    /// Row id, run number, result (the row's new status on failure).
+    Finished(u64, u64, Result<(), Status>),
     Tick,
 }
 
@@ -176,12 +178,14 @@ impl App {
                 Some(Ok(v)) => v,
             };
             // s3://bucket/key becomes its public https URL; a prefix row keeps its link and gets no file.
+            // A file-host page gets its file name once the page has been read.
             let (url, is_file) = match s3::parse(&url) {
+                _ if fuckingfast::parse(&url).is_some() => (url, false),
                 Some(s3::Link::Prefix { .. }) => (url, false),
                 Some(s3::Link::File(u)) => (u, true),
                 None => (url, true),
             };
-            if self.saved.items.iter().any(|i| i.url == url) {
+            if self.saved.items.iter().any(|i| same_link(&i.url, &url)) {
                 dupes += 1;
                 continue;
             }
@@ -261,8 +265,13 @@ impl App {
     /// Starts listings right away and downloads up to the "at once" limit.
     fn pump(&mut self) -> Task<Msg> {
         let parallel = self.saved.parallel;
-        let mut active =
-            self.saved.items.iter().filter(|i| matches!(i.status, Status::Downloading | Status::Verifying)).count();
+        // A file-host page read counts too: it is a request to the same host, and loads cookies.
+        let busy = |i: &Item| match i.status {
+            Status::Downloading | Status::Verifying => true,
+            Status::Listing => fuckingfast::parse(&i.url).is_some(),
+            _ => false,
+        };
+        let mut active = self.saved.items.iter().filter(|i| busy(i)).count();
         let mut tasks = Vec::new();
         for it in &mut self.saved.items {
             if it.status != Status::Queued {
@@ -271,8 +280,17 @@ impl App {
             let (id, client) = (it.id, self.client.clone());
             let run = self.runs + 1;
             // Only prefix rows have no file path, so only they need parsing here.
-            let prefix = if it.dest.as_os_str().is_empty() { s3::parse(&it.url) } else { None };
-            let task = if let Some(s3::Link::Prefix { bucket, region, prefix }) = prefix {
+            let hosted = fuckingfast::parse(&it.url).is_some();
+            let prefix = if it.dest.as_os_str().is_empty() && !hosted { s3::parse(&it.url) } else { None };
+            let task = if hosted && it.dest.as_os_str().is_empty() {
+                if active >= parallel {
+                    continue;
+                }
+                active += 1;
+                it.status = Status::Listing;
+                let url = it.url.clone();
+                Task::perform(async move { fuckingfast::probe(&client, &url).await }, move |r| Msg::Probed(id, run, r))
+            } else if let Some(s3::Link::Prefix { bucket, region, prefix }) = prefix {
                 it.status = Status::Listing;
                 Task::perform(
                     async move { s3::list(&client, &bucket, region.as_deref(), &prefix).await.map(|o| (bucket, o)) },
@@ -284,10 +302,14 @@ impl App {
                 let item = it.clone();
                 let (tx, rx) = mpsc::unbounded();
                 let job = async move {
-                    let r = engine::download(&client, &item, move |e| {
+                    let on = move |e| {
                         let _ = tx.unbounded_send(Msg::Ev(id, e));
-                    })
-                    .await;
+                    };
+                    let r = if hosted {
+                        fuckingfast::download(&client, &item, on).await
+                    } else {
+                        engine::download(&client, &item, on).await.map_err(Status::Failed)
+                    };
                     Msg::Finished(id, run, r)
                 };
                 Task::stream(stream::select(rx, stream::once(job)))
@@ -374,7 +396,7 @@ impl App {
             Msg::Parallel(n) => self.saved.parallel = n as usize,
             Msg::StartAll => {
                 for i in &mut self.saved.items {
-                    if matches!(i.status, Status::Paused | Status::Failed(_)) {
+                    if matches!(i.status, Status::Paused | Status::Failed(_) | Status::Blocked(_)) {
                         i.status = Status::Queued;
                     }
                 }
@@ -392,7 +414,7 @@ impl App {
             Msg::ClearDone => self.saved.items.retain(|i| i.status != Status::Done),
             Msg::Pause(id) => self.pause(id),
             Msg::Resume(id) => {
-                if let Some(i) = self.item(id).filter(|i| matches!(i.status, Status::Paused | Status::Failed(_))) {
+                if let Some(i) = self.item(id).filter(|i| matches!(i.status, Status::Paused | Status::Failed(_) | Status::Blocked(_))) {
                     i.status = Status::Queued;
                 }
             }
@@ -420,6 +442,25 @@ impl App {
                     }
                 }
             }
+            Msg::Probed(id, run, r) => {
+                if self.running.get(&id).is_none_or(|(now, _)| *now != run) {
+                    return Task::none(); // from a read that was paused or removed
+                }
+                self.running.remove(&id);
+                let mut used = self.used();
+                let dest = r.as_ref().ok().map(|(name, _)| self.free_dest(fuckingfast::file_name(name), &mut used));
+                if let Some(i) = self.item(id) {
+                    match (r, dest) {
+                        (Ok((_, size)), Some(dest)) => {
+                            i.dest = dest;
+                            i.total = size;
+                            i.status = Status::Queued;
+                        }
+                        (Err(s), _) => i.status = s,
+                        _ => {}
+                    }
+                }
+            }
             Msg::Finished(id, run, r) => {
                 let current = self.running.get(&id).is_some_and(|(now, _)| *now == run);
                 // Success is true whenever it arrives: the file is in place, even if the row was
@@ -435,7 +476,7 @@ impl App {
                             i.status = Status::Done;
                             i.bytes = i.total.unwrap_or(i.bytes);
                         }
-                        Err(e) => i.status = Status::Failed(e),
+                        Err(s) => i.status = s,
                     }
                 }
             }
@@ -547,12 +588,14 @@ impl App {
         };
         let (label, color): (String, Color) = match &i.status {
             Status::Queued => ("Queued".into(), theme::SILVER),
+            Status::Listing if fuckingfast::parse(&i.url).is_some() => ("Reading page...".into(), theme::AQUA),
             Status::Listing => ("Listing bucket...".into(), theme::AQUA),
             Status::Downloading => (format!("{}/s", human(i.speed as u64)), theme::GREEN),
             Status::Verifying => ("Checking SHA-256...".into(), theme::AQUA),
             Status::Paused => ("Paused".into(), theme::AMBER),
             Status::Done => ("Done".into(), theme::AQUA),
             Status::Failed(_) => ("Failed".into(), theme::RED),
+            Status::Blocked(_) => ("Needs cookies".into(), theme::AMBER),
         };
         let fraction = match (&i.status, i.total) {
             (Status::Done, _) => 1.0,
@@ -568,12 +611,13 @@ impl App {
         let action = match i.status {
             Status::Done => None,
             Status::Paused => Some(small("Resume", theme::AQUA, Msg::Resume(i.id))),
-            Status::Failed(_) => Some(small("Retry", theme::AMBER, Msg::Resume(i.id))),
+            Status::Failed(_) | Status::Blocked(_) => Some(small("Retry", theme::AMBER, Msg::Resume(i.id))),
             _ => Some(small("Pause", theme::SILVER, Msg::Pause(i.id))),
         };
         // The reason gets its own line: it can be long (two hashes on a checksum mismatch).
         let (failed, why) = match &i.status {
             Status::Failed(e) => (true, Some(text(e).size(13).color(theme::RED))),
+            Status::Blocked(e) => (false, Some(text(e).size(13).color(theme::INK_SOFT))),
             _ => (false, None),
         };
         container(
@@ -596,6 +640,11 @@ impl App {
         .style(theme::row_glass)
         .into()
     }
+}
+
+/// Equal URLs, or two spellings of the same file-host link (www, #name, trailing slash).
+fn same_link(a: &str, b: &str) -> bool {
+    a == b || fuckingfast::parse(a).zip(fuckingfast::parse(b)).is_some_and(|(x, y)| x.key() == y.key())
 }
 
 fn is_pending(s: &Status) -> bool {
@@ -627,6 +676,13 @@ mod tests {
         assert_eq!(parse_line(&format!("https://h/x {sha}")).unwrap(), Ok(("https://h/x".into(), Some(sha))));
         assert!(parse_line("ftp://h/x").unwrap().is_err());
         assert!(parse_line("https://h/x sha256=nope").unwrap().is_err());
+    }
+
+    #[test]
+    fn file_host_dedup() {
+        assert!(same_link("https://fuckingfast.co/abcDEF123456", "http://www.fuckingfast.co/abcDEF123456/#Name.rar"));
+        assert!(!same_link("https://fuckingfast.co/abcDEF123456", "https://fuckingfast.co/abcDEF123457"));
+        assert!(same_link("https://h/x", "https://h/x") && !same_link("https://h/x", "https://h/x/"));
     }
 
     #[test]

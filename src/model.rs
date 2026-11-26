@@ -12,6 +12,8 @@ pub enum Status {
     Paused,
     Done,
     Failed(String),
+    /// Needs something only the user can give (fresh Cloudflare cookies), then Retry.
+    Blocked(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,7 +68,7 @@ pub fn file_name(url: &str) -> PathBuf {
     safe_rel(decoded.rsplit(['/', '\\']).next().unwrap_or(""))
 }
 
-fn percent_decode(s: &str) -> String {
+pub fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;

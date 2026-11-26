@@ -1,7 +1,7 @@
 //! Downloads one item to disk with resume, retry and an optional SHA-256 check.
 use crate::model::{Item, part_path};
 use futures_util::StreamExt;
-use reqwest::header::{CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE};
+use reqwest::header::{CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderMap, IF_RANGE, LAST_MODIFIED, RANGE};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -16,21 +16,36 @@ pub enum Event {
 }
 
 /// Retries wait 1x, 2x, 4x this.
-const BASE_DELAY_MS: u64 = if cfg!(test) { 10 } else { 1000 };
-const RETRIES: u32 = 3;
+pub(crate) const BASE_DELAY_MS: u64 = if cfg!(test) { 10 } else { 1000 };
+pub(crate) const RETRIES: u32 = 3;
 
 /// (message, worth retrying)
 type Fail = (String, bool);
 
 /// Downloads `item.url` to `item.dest`. Returns Ok(()) once the finished file is at `item.dest`.
 /// Cancel/pause = the caller drops this future; the `.part` file stays for a later resume.
-pub async fn download(client: &reqwest::Client, item: &Item, mut on: impl FnMut(Event) + Send) -> Result<(), String> {
+pub async fn download(client: &reqwest::Client, item: &Item, on: impl FnMut(Event) + Send) -> Result<(), String> {
+    download_from(client, item, &item.url, &HeaderMap::new(), false, on).await
+}
+
+/// Like `download`, but fetches `url` with extra `headers`. `hosted` is for file-host links:
+/// resume from the `.part` size even without a validator, and reject an HTML reply (a challenge
+/// or expired session page) instead of saving it.
+pub async fn download_from(
+    client: &reqwest::Client,
+    item: &Item,
+    url: &str,
+    headers: &HeaderMap,
+    hosted: bool,
+    mut on: impl FnMut(Event) + Send,
+) -> Result<(), String> {
+    let src = Src { url, headers, hosted };
     if let Some(dir) = item.dest.parent() {
         tokio::fs::create_dir_all(dir).await.map_err(|e| format!("Cannot create folder: {e}"))?;
     }
     let mut etag = item.etag.clone();
     for attempt in 0..=RETRIES {
-        match fetch(client, item, &mut etag, &mut on).await {
+        match fetch(client, item, &src, &mut etag, &mut on).await {
             Ok(()) => break,
             Err((msg, retry)) => {
                 if !retry || attempt == RETRIES {
@@ -75,20 +90,29 @@ fn hash_file(p: &std::path::Path) -> std::io::Result<String> {
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+struct Src<'a> {
+    url: &'a str,
+    headers: &'a HeaderMap,
+    hosted: bool,
+}
+
 /// One attempt: brings the .part file to full size, resuming when possible.
-async fn fetch(client: &reqwest::Client, item: &Item, etag: &mut Option<String>, on: &mut impl FnMut(Event)) -> Result<(), Fail> {
+async fn fetch(client: &reqwest::Client, item: &Item, src: &Src<'_>, etag: &mut Option<String>, on: &mut impl FnMut(Event)) -> Result<(), Fail> {
     let part = part_path(&item.dest);
     let mut n = tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0);
-    if etag.is_none() {
+    if etag.is_none() && !src.hosted {
         n = 0; // nothing to prove the old bytes belong to this file
     }
     let mut restarted = false;
     let resp = loop {
-        let mut req = client.get(&item.url);
-        if let (true, Some(v)) = (n > 0, etag.as_ref()) {
-            req = req.header(RANGE, format!("bytes={n}-")).header(IF_RANGE, v);
+        let mut req = client.get(src.url).headers(src.headers.clone());
+        if n > 0 {
+            req = req.header(RANGE, format!("bytes={n}-"));
+            if let Some(v) = etag.as_ref() {
+                req = req.header(IF_RANGE, v);
+            }
         }
-        let resp = req.send().await.map_err(|e| (format!("Network error: {}", short(&e)), true))?;
+        let resp = req.send().await.map_err(|e| (format!("Network error: {}", short(e)), true))?;
         if resp.status().as_u16() == 416 && n > 0 {
             let size = resp.headers().get(CONTENT_RANGE).and_then(|v| v.to_str().ok()).and_then(|v| v.rsplit('/').next()?.parse::<u64>().ok());
             if size == Some(n) {
@@ -112,6 +136,9 @@ async fn fetch(client: &reqwest::Client, item: &Item, etag: &mut Option<String>,
         return Err((format!("HTTP {c} {}", st.canonical_reason().unwrap_or("")).trim_end().to_string(), retry));
     }
     let h = resp.headers();
+    if src.hosted && h.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|t| t.trim_start().to_ascii_lowercase().starts_with("text/html")) {
+        return Err(("Got a web page instead of the file (expired link or a Cloudflare check); Retry fetches a fresh link".into(), false));
+    }
     if st.as_u16() == 206 {
         // Some servers ignore If-Range. Appending the wrong range or a changed file would silently corrupt the result.
         let head = |k| h.get(k).and_then(|v| v.to_str().ok());
@@ -143,7 +170,7 @@ async fn fetch(client: &reqwest::Client, item: &Item, etag: &mut Option<String>,
     let mut last = Instant::now();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| (format!("Network error: {}", short(&e)), true))?;
+        let chunk = chunk.map_err(|e| (format!("Network error: {}", short(e)), true))?;
         file.write_all(&chunk).await.map_err(io_fail)?;
         n += chunk.len() as u64;
         if last.elapsed() >= Duration::from_millis(200) {
@@ -165,8 +192,9 @@ fn io_fail(e: std::io::Error) -> Fail {
 }
 
 /// Outermost reqwest message only; the full chain is too long for a table row.
-fn short(e: &reqwest::Error) -> String {
-    let mut s = e.to_string();
+/// The URL is dropped: a file host's direct link carries a signed query string.
+pub(crate) fn short(e: reqwest::Error) -> String {
+    let mut s = e.without_url().to_string();
     if s.len() > 80 {
         s.truncate(80);
     }
@@ -227,10 +255,12 @@ mod tests {
                     let rn = range.as_deref().and_then(|r| r.strip_prefix("bytes=")?.strip_suffix('-')?.parse::<usize>().ok());
                     let head = if text.contains(" /missing ") {
                         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else if text.contains(" /page ") {
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
                     } else if let Some(n) = rn {
                         if n >= size {
                             format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{size}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                        } else if hdr("if-range").as_deref() == Some(ETAG_V) {
+                        } else if hdr("if-range").is_none_or(|v| v == ETAG_V) {
                             format!(
                                 "HTTP/1.1 206 Partial Content\r\nETag: {ETAG_V}\r\nContent-Range: bytes {n}-{}/{size}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                                 size - 1,
@@ -285,6 +315,11 @@ mod tests {
         let mut ev = Vec::new();
         let r = download(&reqwest::Client::new(), item, |e| ev.push(e)).await;
         (r, ev)
+    }
+
+    /// File-host mode: resume from the .part size without a validator, refuse HTML.
+    async fn run_hosted(item: &Item) -> Result<(), String> {
+        download_from(&reqwest::Client::new(), item, &item.url, &HeaderMap::new(), true, |_| {}).await
     }
 
     fn seed_part(item: &Item, len: usize) {
@@ -386,6 +421,69 @@ mod tests {
         let (r, _) = run(&item).await;
         assert!(r.unwrap_err().contains("404"));
         assert_eq!(srv.log.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn hosted_206_appends_without_validator() {
+        let srv = serve(body(), None).await;
+        let (item, dir) = setup("h206", &srv.url);
+        seed_part(&item, 120_000);
+        assert_eq!(run_hosted(&item).await, Ok(()));
+        assert_eq!(std::fs::read(&item.dest).unwrap(), body());
+        assert_eq!(srv.log.lock().unwrap().as_slice(), [Some("bytes=120000-".to_string())]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosted_200_after_range_restarts() {
+        let srv = serve(body(), None).await;
+        let (mut item, dir) = setup("h200", &srv.url);
+        item.etag = Some("\"old\"".into()); // If-Range no longer matches, so the server sends 200
+        std::fs::create_dir_all(item.dest.parent().unwrap()).unwrap();
+        std::fs::write(part_path(&item.dest), vec![7u8; 50_000]).unwrap();
+        assert_eq!(run_hosted(&item).await, Ok(()));
+        assert_eq!(std::fs::read(&item.dest).unwrap(), body());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosted_416_finalizes_or_restarts() {
+        let srv = serve(body(), None).await;
+        let (item, dir) = setup("h416", &srv.url);
+        seed_part(&item, 300_000);
+        assert_eq!(run_hosted(&item).await, Ok(()));
+        assert_eq!(std::fs::read(&item.dest).unwrap(), body());
+        assert_eq!(srv.log.lock().unwrap().len(), 1);
+
+        // A .part longer than the file cannot be ours: drop it and start over.
+        std::fs::remove_file(&item.dest).unwrap();
+        std::fs::write(part_path(&item.dest), vec![0u8; 300_010]).unwrap();
+        assert_eq!(run_hosted(&item).await, Ok(()));
+        assert_eq!(std::fs::read(&item.dest).unwrap(), body());
+        assert_eq!(srv.log.lock().unwrap()[1..], [Some("bytes=300010-".to_string()), None]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosted_interrupted_keeps_part_and_retries() {
+        let srv = serve(body(), Some((100_000, 2))).await;
+        let (item, dir) = setup("hcut", &srv.url);
+        assert_eq!(run_hosted(&item).await, Ok(()));
+        assert_eq!(std::fs::read(&item.dest).unwrap(), body());
+        let log = srv.log.lock().unwrap();
+        assert_eq!(log.as_slice(), [None, Some("bytes=100000-".to_string()), Some("bytes=200000-".to_string())]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosted_rejects_html_plain_does_not() {
+        let srv = serve(body(), None).await;
+        let (item, dir) = setup("hhtml", &srv.url.replace("f.bin", "page"));
+        assert!(run_hosted(&item).await.unwrap_err().contains("web page"));
+        assert!(!item.dest.exists());
+        assert_eq!(srv.log.lock().unwrap().len(), 1);
+        assert_eq!(run(&item).await.0, Ok(()));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

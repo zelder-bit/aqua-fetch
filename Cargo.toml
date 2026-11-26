@@ -9,7 +9,9 @@ futures-util = "0.3.34"
 iced = { version = "0.14.0", features = ["image", "tokio", "advanced"] }
 quick-xml = { version = "0.42.0", features = ["serialize"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["stream", "rustls"] }
+regex = "1.13.2"
 rfd = "0.18.0"
+rookie = "0.5.6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.2"
