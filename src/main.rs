@@ -182,7 +182,7 @@ impl App {
             let (url, is_file) = match s3::parse(&url) {
                 _ if fuckingfast::parse(&url).is_some() => (url, false),
                 Some(s3::Link::Prefix { .. }) => (url, false),
-                Some(s3::Link::File(u)) => (u, true),
+                Some(s3::Link::File { url, .. }) => (url, true),
                 None => (url, true),
             };
             if self.saved.items.iter().any(|i| same_link(&i.url, &url)) {
@@ -307,6 +307,8 @@ impl App {
                     };
                     let r = if hosted {
                         fuckingfast::download(&client, &item, on).await
+                    } else if matches!(s3::parse(&item.url), Some(s3::Link::File { .. })) {
+                        s3::download(&client, &item, on).await.map_err(Status::Failed)
                     } else {
                         engine::download(&client, &item, on).await.map_err(Status::Failed)
                     };

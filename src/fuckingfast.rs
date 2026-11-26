@@ -533,7 +533,7 @@ async fn run(client: &Client, s: &mut Session, base: &str, link: &Link, item: &I
         s.cookies.extend(set_cookies(r.headers(), cb.host_str().unwrap_or_default()));
     }
     let h = headers(s, &direct, Some(&page), None)?;
-    engine::download_from(client, item, direct.as_str(), &h, true, on).await.map_err(Status::Failed)
+    engine::download_from(client, item, direct.as_str(), &|| h.clone(), true, on).await.map_err(Status::Failed)
 }
 
 #[cfg(test)]

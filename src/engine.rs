@@ -25,17 +25,18 @@ type Fail = (String, bool);
 /// Downloads `item.url` to `item.dest`. Returns Ok(()) once the finished file is at `item.dest`.
 /// Cancel/pause = the caller drops this future; the `.part` file stays for a later resume.
 pub async fn download(client: &reqwest::Client, item: &Item, on: impl FnMut(Event) + Send) -> Result<(), String> {
-    download_from(client, item, &item.url, &HeaderMap::new(), false, on).await
+    download_from(client, item, &item.url, &HeaderMap::new, false, on).await
 }
 
-/// Like `download`, but fetches `url` with extra `headers`. `hosted` is for file-host links:
+/// Like `download`, but fetches `url` with extra headers from `headers`, called for every request
+/// (so signed requests get a fresh signature on each retry). `hosted` is for file-host links:
 /// resume from the `.part` size even without a validator, and reject an HTML reply (a challenge
 /// or expired session page) instead of saving it.
 pub async fn download_from(
     client: &reqwest::Client,
     item: &Item,
     url: &str,
-    headers: &HeaderMap,
+    headers: &(dyn Fn() -> HeaderMap + Sync),
     hosted: bool,
     mut on: impl FnMut(Event) + Send,
 ) -> Result<(), String> {
@@ -92,7 +93,7 @@ fn hash_file(p: &std::path::Path) -> std::io::Result<String> {
 
 struct Src<'a> {
     url: &'a str,
-    headers: &'a HeaderMap,
+    headers: &'a (dyn Fn() -> HeaderMap + Sync),
     hosted: bool,
 }
 
@@ -105,7 +106,7 @@ async fn fetch(client: &reqwest::Client, item: &Item, src: &Src<'_>, etag: &mut 
     }
     let mut restarted = false;
     let resp = loop {
-        let mut req = client.get(src.url).headers(src.headers.clone());
+        let mut req = client.get(src.url).headers((src.headers)());
         if n > 0 {
             req = req.header(RANGE, format!("bytes={n}-"));
             if let Some(v) = etag.as_ref() {
@@ -319,7 +320,7 @@ mod tests {
 
     /// File-host mode: resume from the .part size without a validator, refuse HTML.
     async fn run_hosted(item: &Item) -> Result<(), String> {
-        download_from(&reqwest::Client::new(), item, &item.url, &HeaderMap::new(), true, |_| {}).await
+        download_from(&reqwest::Client::new(), item, &item.url, &HeaderMap::new, true, |_| {}).await
     }
 
     fn seed_part(item: &Item, len: usize) {
@@ -485,5 +486,21 @@ mod tests {
         assert_eq!(srv.log.lock().unwrap().len(), 1);
         assert_eq!(run(&item).await.0, Ok(()));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn headers_rebuilt_for_every_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let srv = serve(body(), Some((100_000, 2))).await;
+        let (item, dir) = setup("hdrs", &srv.url);
+        let calls = AtomicUsize::new(0);
+        let headers = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            HeaderMap::new()
+        };
+        assert_eq!(download_from(&reqwest::Client::new(), &item, &item.url, &headers, false, |_| {}).await, Ok(()));
+        assert_eq!(calls.load(Ordering::SeqCst), srv.log.lock().unwrap().len());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

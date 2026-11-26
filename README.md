@@ -8,13 +8,13 @@ A small desktop download manager for fetching many files at once, with a Frutige
 
 - Downloads any direct HTTP(S) link, 1 to 16 at a time.
 - Understands `https://fuckingfast.co/<id>` file pages (see below).
-- Understands public S3 links: `s3://bucket/key` for one object, or `s3://bucket/folder/` to queue every object under that prefix, keeping the folder layout. The usual `https://bucket.s3.region.amazonaws.com/...` forms work too.
+- Understands S3 links, public or private (with your AWS credentials, see below): `s3://bucket/key` for one object, or `s3://bucket/folder/` to queue every object under that prefix, keeping the folder layout. The usual `https://bucket.s3.region.amazonaws.com/...` forms work too.
 - Resumes partial files after a pause, crash or dropped connection, and retries failures three times.
 - Checks a SHA-256 when you give one.
 - Remembers the queue between runs.
 - Imports links from a text file.
 
-Apart from fuckingfast.co, it only fetches direct links, where the URL itself returns the file. It does not handle private S3 buckets, logins, or other file-hosting pages.
+Apart from S3 and fuckingfast.co, it only fetches direct links, where the URL itself returns the file. It does not handle logins or other file-hosting pages.
 
 ## Install
 
@@ -44,6 +44,33 @@ https://example.org/big.tar.gz sha256=<64 hex characters>
 ```
 
 The same format works for **Import .txt**.
+
+## Private S3 buckets
+
+When AWS credentials are set up, every S3 listing and download is signed with them, so private buckets work like public ones. Aqua Fetch looks where the AWS CLI does:
+
+1. `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` in the environment.
+2. The `default` profile, or the one named in `AWS_PROFILE`, in `~/.aws/credentials` and `~/.aws/config` (`AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` move them).
+
+The quickest setup is `aws configure`, or write the file by hand:
+
+```ini
+# ~/.aws/credentials
+[default]
+aws_access_key_id = AKIA...
+aws_secret_access_key = ...
+```
+
+The bucket's region is asked of S3 itself, then taken from `AWS_REGION`, `AWS_DEFAULT_REGION` or the profile's `region`.
+
+With no credentials, S3 requests go out anonymously as before. Profiles that get their keys through SSO, a role or `credential_process` are not read directly. Export them in a terminal and start Aqua Fetch from there:
+
+```bash
+eval "$(aws configure export-credentials --format env)"
+aqua-fetch &
+```
+
+Keys are read on each listing and download, so a refreshed session token is picked up without a restart. They are never written to the queue or shown in messages.
 
 ## fuckingfast.co links
 
@@ -86,7 +113,7 @@ The file keeps its cookies as plain text, so keep it private (`chmod 600`). They
 ## Known limits
 
 - Very large S3 listings (tens of thousands of objects) make the window sluggish.
-- A single `s3://` file in a bucket with dots in its name, outside us-east-1, fails with HTTP 301. Listing that bucket works.
+- Without AWS credentials, a single `s3://` file in a bucket with dots in its name, outside us-east-1, fails with HTTP 301. Listing that bucket works.
 - S3 keys containing `.` or `..` path parts are skipped.
 - The text uses the Lato font when it is installed and falls back to the system default otherwise.
 

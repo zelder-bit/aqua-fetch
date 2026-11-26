@@ -1,3 +1,4 @@
+pub mod aws;
 pub mod engine;
 pub mod fuckingfast;
 pub mod model;

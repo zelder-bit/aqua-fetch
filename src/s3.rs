@@ -1,10 +1,16 @@
-//! Public (anonymous, unsigned) S3 links: recognise them and list bucket prefixes.
+//! S3 links: recognise them, list bucket prefixes and download objects.
+//! Requests are signed when AWS credentials are configured (see `aws`), else anonymous.
+use crate::aws::{self, Creds, UNSIGNED};
+use crate::engine::{self, Event};
+use crate::model::Item;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Link {
-    /// One object; the String is its public https URL.
-    File(String),
+    /// One object. `url` is its https URL (as given, query intact, for https input).
+    File { url: String, bucket: String, region: Option<String>, key: String },
     /// A bucket or prefix to list.
     Prefix { bucket: String, region: Option<String>, prefix: String },
 }
@@ -45,11 +51,8 @@ pub fn parse(url: &str) -> Option<Link> {
         return Some(Link::Prefix { bucket: bucket.into(), region: region.map(Into::into), prefix: key });
     }
     // https input is returned as given (query intact); s3:// gets a built URL.
-    Some(Link::File(if scheme.eq_ignore_ascii_case("s3") {
-        format!("{}/{}", base(bucket, None), encode_key(&key))
-    } else {
-        url.to_string()
-    }))
+    let url = if is_s3 { format!("{}/{}", base(bucket, None), encode_key(&key)) } else { url.to_string() };
+    Some(Link::File { url, bucket: bucket.into(), region: region.map(Into::into), key })
 }
 
 /// Splits an amazonaws.com host into (bucket, region, path_style). For path-style the bucket is empty.
@@ -59,13 +62,18 @@ fn split_host(host: &str) -> Option<(&str, Option<&str>, bool)> {
         return Some(("", None, true));
     }
     if let Some(r) = h.strip_prefix("s3.").or_else(|| h.strip_prefix("s3-")) {
-        return (!r.contains('.')).then_some(("", Some(r), true));
+        return (!r.contains('.')).then_some(("", region_name(r), true));
     }
     if let Some(b) = h.strip_suffix(".s3") {
         return Some((b, None, false));
     }
     let (b, r) = h.rfind(".s3.").map(|i| (&h[..i], &h[i + 4..])).or_else(|| h.rfind(".s3-").map(|i| (&h[..i], &h[i + 4..])))?;
-    (!r.contains('.')).then_some((b, Some(r), false))
+    (!r.contains('.')).then_some((b, region_name(r), false))
+}
+
+/// `eu-west-1` style names only; accelerate, external-1 and website hosts are not regions.
+fn region_name(r: &str) -> Option<&str> {
+    (r.matches('-').count() >= 2 && r.ends_with(|c: char| c.is_ascii_digit()) && !r.starts_with("website")).then_some(r)
 }
 
 /// Endpoint for a bucket. Dotted names use path-style because virtual-hosted TLS fails for them.
@@ -78,7 +86,8 @@ fn encode_key(key: &str) -> String {
     key.split('/').map(encode).collect::<Vec<_>>().join("/")
 }
 
-fn encode(s: &str) -> String {
+/// AWS's URI encoding: everything but unreserved characters as %XX.
+pub(crate) fn encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
@@ -137,8 +146,10 @@ fn parse_listing(xml: &str) -> Result<Page, String> {
     Ok((items, if l.truncated { l.next } else { None }))
 }
 
-fn error_text(status: reqwest::StatusCode, body: &str) -> String {
-    let mut msg = if status == reqwest::StatusCode::FORBIDDEN {
+fn error_text(status: reqwest::StatusCode, body: &str, signed: bool) -> String {
+    let mut msg = if status == reqwest::StatusCode::FORBIDDEN && signed {
+        "your AWS credentials may not list this bucket (HTTP 403)".to_string()
+    } else if status == reqwest::StatusCode::FORBIDDEN {
         "bucket does not allow public listing (HTTP 403)".to_string()
     } else {
         format!("S3 listing failed (HTTP {status})")
@@ -152,9 +163,17 @@ fn error_text(status: reqwest::StatusCode, body: &str) -> String {
     msg
 }
 
-/// Anonymous ListObjectsV2, following continuation tokens until done.
+/// ListObjectsV2, following continuation tokens until done. Signed when credentials are configured.
 pub async fn list(client: &reqwest::Client, bucket: &str, region: Option<&str>, prefix: &str) -> Result<Vec<Object>, String> {
+    let (creds, note) = creds();
+    list_with(client, creds.as_ref(), bucket, region, prefix).await.map_err(|e| add_note(e, note))
+}
+
+async fn list_with(client: &reqwest::Client, creds: Option<&Creds>, bucket: &str, region: Option<&str>, prefix: &str) -> Result<Vec<Object>, String> {
     let mut region = region.map(str::to_string);
+    if let (Some(c), None) = (creds, &region) {
+        region = Some(find_region(client, c, bucket).await);
+    }
     let mut retried = false;
     let mut token: Option<String> = None;
     let mut out = Vec::new();
@@ -164,17 +183,23 @@ pub async fn list(client: &reqwest::Client, bucket: &str, region: Option<&str>, 
         if let Some(t) = &token {
             url.push_str(&format!("&continuation-token={}", encode(t)));
         }
-        let resp = client.get(&url).send().await.map_err(|e| format!("S3 request failed: {e}"))?;
+        let mut req = client.get(&url);
+        if let (Some(c), Some(r)) = (creds, &region) {
+            req = req.headers(signed(c, &url, r)?);
+        }
+        let resp = req.send().await.map_err(|e| format!("S3 request failed: {}", engine::short(e)))?;
         let status = resp.status();
         let hint = resp.headers().get("x-amz-bucket-region").and_then(|v| v.to_str().ok()).map(str::to_string);
-        if let (false, None, Some(r), true) = (retried, &region, hint, status.as_u16() == 301 || status.as_u16() == 400) {
+        // Wrong or unknown region: S3 names the right one. A signed request may have guessed it.
+        let guessed = region.is_none() || creds.is_some();
+        if let (false, true, Some(r), true) = (retried, guessed, hint, status.as_u16() == 301 || status.as_u16() == 400) {
             region = Some(r);
             retried = true;
             continue;
         }
-        let body = resp.text().await.map_err(|e| format!("S3 response failed: {e}"))?;
+        let body = resp.text().await.map_err(|e| format!("S3 response failed: {}", engine::short(e)))?;
         if !status.is_success() {
-            return Err(error_text(status, &body));
+            return Err(error_text(status, &body, creds.is_some()));
         }
         let (items, next) = parse_listing(&body)?;
         out.extend(items.into_iter().map(|(key, size)| Object { url: format!("{root}/{}", encode_key(&key)), key, size }));
@@ -183,6 +208,61 @@ pub async fn list(client: &reqwest::Client, bucket: &str, region: Option<&str>, 
             None => return Ok(out),
         }
     }
+}
+
+/// Credentials, or None plus a note when the AWS setup could not be used (then requests go anonymous).
+fn creds() -> (Option<Creds>, Option<String>) {
+    match aws::load() {
+        Ok(c) => (c, None),
+        Err(note) => (None, Some(note)),
+    }
+}
+
+fn add_note(e: String, note: Option<String>) -> String {
+    match note {
+        Some(n) => format!("{e}. Sent without AWS credentials: {n}"),
+        None => e,
+    }
+}
+
+/// The bucket's region from S3 itself (HEAD answers with it even when access is denied),
+/// else the profile's region, else us-east-1.
+async fn find_region(client: &reqwest::Client, c: &Creds, bucket: &str) -> String {
+    // Path-style, so dotted bucket names work over TLS.
+    let head = client.head(format!("https://s3.amazonaws.com/{}", encode(bucket))).send().await.ok();
+    let hint = head.and_then(|r| r.headers().get("x-amz-bucket-region")?.to_str().ok().map(str::to_string));
+    hint.or_else(|| c.region.clone()).unwrap_or_else(|| "us-east-1".into())
+}
+
+fn signed(c: &Creds, url: &str, region: &str) -> Result<HeaderMap, String> {
+    let u = reqwest::Url::parse(url).map_err(|e| format!("Bad S3 URL: {e}"))?;
+    let mut h = HeaderMap::new();
+    for (k, v) in aws::sign(c, "GET", &u, region, &[], UNSIGNED, SystemTime::now()) {
+        let mut v = HeaderValue::from_str(&v).map_err(|_| "AWS credentials contain characters a header cannot carry".to_string())?;
+        v.set_sensitive(true);
+        h.insert(HeaderName::from_bytes(k.as_bytes()).map_err(|e| e.to_string())?, v);
+    }
+    Ok(h)
+}
+
+/// Downloads an S3 object row: signed when credentials are configured, else exactly like a plain link.
+pub async fn download(client: &reqwest::Client, item: &Item, on: impl FnMut(Event) + Send) -> Result<(), String> {
+    let (creds, note) = creds();
+    // A presigned link carries its own signature; S3 refuses a second one in a header.
+    let presigned = reqwest::Url::parse(&item.url).is_ok_and(|u| u.query_pairs().any(|(k, _)| k == "X-Amz-Signature" || k == "Signature"));
+    let (Some(c), Some(Link::File { bucket, region, key, .. }), false) = (creds, parse(&item.url), presigned) else {
+        return engine::download(client, item, on).await.map_err(|e| add_note(e, note));
+    };
+    let region = match region {
+        Some(r) => r,
+        None => find_region(client, &c, &bucket).await,
+    };
+    // Rebuilt on the regional endpoint with a canonically encoded key, so the signature matches what is sent.
+    let query = reqwest::Url::parse(&item.url).ok().and_then(|u| u.query().map(|q| format!("?{q}"))).unwrap_or_default();
+    let url = format!("{}/{}{query}", base(&bucket, Some(&region)), encode_key(&key));
+    signed(&c, &url, &region)?; // report bad URLs or credentials once, up front
+    let sign = || signed(&c, &url, &region).unwrap_or_default();
+    engine::download_from(client, item, &url, &sign, false, on).await
 }
 
 #[cfg(test)]
@@ -206,9 +286,12 @@ mod tests {
         assert_eq!(parse("https://s3.us-east-2.amazonaws.com/my-bucket"), prefix("my-bucket", Some("us-east-2"), ""));
         assert_eq!(parse("https://a.b.c.s3.eu-west-1.amazonaws.com/x/"), prefix("a.b.c", Some("eu-west-1"), "x/"));
         let f = "https://my-bucket.s3.amazonaws.com/a/b%20c.zip?versionId=3";
-        assert_eq!(parse(f), Some(Link::File(f.into())));
+        assert_eq!(parse(f), Some(file(f, "my-bucket", None, "a/b c.zip")));
         let f = "https://s3.eu-west-1.amazonaws.com/my-bucket/k.bin";
-        assert_eq!(parse(f), Some(Link::File(f.into())));
+        assert_eq!(parse(f), Some(file(f, "my-bucket", Some("eu-west-1"), "k.bin")));
+        for (f, b) in [("https://bkt.s3-accelerate.amazonaws.com/k", "bkt"), ("https://bkt.s3-external-1.amazonaws.com/k", "bkt"), ("https://s3-external-1.amazonaws.com/bkt/k", "bkt")] {
+            assert_eq!(parse(f), Some(file(f, b, None, "k")), "{f}");
+        }
     }
 
     #[test]
@@ -225,10 +308,15 @@ mod tests {
         }
     }
 
+    fn file(url: &str, bucket: &str, region: Option<&str>, key: &str) -> Link {
+        Link::File { url: url.into(), bucket: bucket.into(), region: region.map(Into::into), key: key.into() }
+    }
+
     #[test]
     fn s3_scheme_file_urls() {
-        assert_eq!(parse("s3://bkt/dir/my file&x.txt"), Some(Link::File("https://bkt.s3.amazonaws.com/dir/my%20file%26x.txt".into())));
-        assert_eq!(parse("s3://my.bkt/a b.txt"), Some(Link::File("https://s3.amazonaws.com/my.bkt/a%20b.txt".into())));
+        let f = "https://bkt.s3.amazonaws.com/dir/my%20file%26x.txt";
+        assert_eq!(parse("s3://bkt/dir/my file&x.txt"), Some(file(f, "bkt", None, "dir/my file&x.txt")));
+        assert_eq!(parse("s3://my.bkt/a b.txt"), Some(file("https://s3.amazonaws.com/my.bkt/a%20b.txt", "my.bkt", None, "a b.txt")));
     }
 
     const PAGE1: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -252,9 +340,9 @@ mod tests {
     fn listing_error_xml() {
         let xml = "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>";
         assert!(parse_listing(xml).is_err());
-        let msg = error_text(reqwest::StatusCode::FORBIDDEN, xml);
+        let msg = error_text(reqwest::StatusCode::FORBIDDEN, xml, false);
         assert!(msg.contains("public listing") && msg.contains("AccessDenied: Access Denied"), "{msg}");
-        assert_eq!(error_text(reqwest::StatusCode::NOT_FOUND, "junk"), "S3 listing failed (HTTP 404 Not Found)");
+        assert_eq!(error_text(reqwest::StatusCode::NOT_FOUND, "junk", false), "S3 listing failed (HTTP 404 Not Found)");
     }
 
     #[tokio::test]
