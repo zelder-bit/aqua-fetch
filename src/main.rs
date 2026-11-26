@@ -120,6 +120,8 @@ impl App {
             state_path,
             input: text_editor::Content::new(),
             client: reqwest::Client::builder()
+                // Many servers and CDNs answer 403 to requests that name no client at all.
+                .user_agent(concat!("aqua-fetch/", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(Duration::from_secs(20))
                 .read_timeout(Duration::from_secs(60))
                 .build()
